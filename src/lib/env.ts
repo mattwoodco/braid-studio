@@ -40,9 +40,7 @@ const SetupEnvSchema = z.object({
 export function getSetupEnv(): z.infer<typeof SetupEnvSchema> {
   const parsed = SetupEnvSchema.safeParse(process.env);
   if (!parsed.success) {
-    throw new Error(
-      `[env] setup needs ANTHROPIC_API_KEY and FAL_API_KEY in .env.local`,
-    );
+    throw new Error(`[env] setup needs ANTHROPIC_API_KEY and FAL_API_KEY in .env.local`);
   }
   return parsed.data;
 }

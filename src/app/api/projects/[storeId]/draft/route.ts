@@ -1,17 +1,17 @@
+import { randomUUID } from "node:crypto";
 /**
  * POST /api/projects/[storeId]/draft  — fast text-to-video lane.
  *
  * Plan N shots in one Claude call (forced tool_use). Parallel fal t2v.
  * Local ffmpeg compose. Returns the local mp4 path + wall time.
  */
-import { mkdir, copyFile, stat } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { copyFile, mkdir, stat } from "node:fs/promises";
 import { resolve as resolvePath } from "node:path";
+import { submitTextToVideo } from "@/lib/fal";
+import { composeClips, ffprobeDuration } from "@/lib/ffmpeg";
 import Anthropic from "@anthropic-ai/sdk";
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { submitTextToVideo } from "@/lib/fal";
-import { composeClips, ffprobeDuration } from "@/lib/ffmpeg";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -49,7 +49,10 @@ const SHOT_LIST_TOOL = {
 };
 
 const ShotPlanSchema = z.object({
-  shots: z.array(z.object({ video_prompt: z.string().min(4).max(800) })).min(1).max(5),
+  shots: z
+    .array(z.object({ video_prompt: z.string().min(4).max(800) }))
+    .min(1)
+    .max(5),
 });
 
 async function planShots(brief: string, n: number): Promise<string[]> {
@@ -75,16 +78,12 @@ async function planShots(brief: string, n: number): Promise<string[]> {
     system,
     tools: [SHOT_LIST_TOOL],
     tool_choice: { type: "tool", name: SHOT_LIST_TOOL.name },
-    messages: [
-      { role: "user", content: `Brief: ${brief}\n\nProduce exactly ${n} shots.` },
-    ],
+    messages: [{ role: "user", content: `Brief: ${brief}\n\nProduce exactly ${n} shots.` }],
   };
   const res = (await client.messages.create(
     args as unknown as Parameters<typeof client.messages.create>[0],
   )) as unknown as CreateRes;
-  const block = res.content.find(
-    (c) => c.type === "tool_use" && c.name === SHOT_LIST_TOOL.name,
-  );
+  const block = res.content.find((c) => c.type === "tool_use" && c.name === SHOT_LIST_TOOL.name);
   if (!block) throw new Error("planShots: no submit_shot_list tool_use returned");
   const parsed = ShotPlanSchema.safeParse(block.input);
   if (!parsed.success) {
@@ -113,9 +112,7 @@ export async function POST(
 
   try {
     const prompts = await planShots(parsed.data.brief, n);
-    const results = await Promise.all(
-      prompts.map((p) => submitTextToVideo({ prompt: p })),
-    );
+    const results = await Promise.all(prompts.map((p) => submitTextToVideo({ prompt: p })));
     const clipUrls = results.map((r) => r.videoUrl);
 
     const runId = randomUUID();

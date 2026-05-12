@@ -1,10 +1,10 @@
+import { sendEvent } from "@/lib/anthropic";
 /**
  * POST /api/projects/[storeId]/studio/[sessionId]  — post a user.message
  * follow-up to an existing session.
  */
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { sendEvent } from "@/lib/anthropic";
 
 export const dynamic = "force-dynamic";
 

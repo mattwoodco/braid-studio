@@ -1,3 +1,5 @@
+import { createSession, sendEvent } from "@/lib/anthropic";
+import { getEnv } from "@/lib/env";
 /**
  * POST /api/projects/[storeId]/studio  — create an agent session and seed it.
  *
@@ -5,8 +7,6 @@
  */
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { createSession, sendEvent } from "@/lib/anthropic";
-import { getEnv } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 

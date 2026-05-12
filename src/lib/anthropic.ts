@@ -149,9 +149,8 @@ interface MemoryStoresResourceLike {
 }
 
 function getMemoryStores(client: Anthropic): MemoryStoresResourceLike {
-  return (
-    client as unknown as { beta: { memoryStores: MemoryStoresResourceLike } }
-  ).beta.memoryStores;
+  return (client as unknown as { beta: { memoryStores: MemoryStoresResourceLike } }).beta
+    .memoryStores;
 }
 
 export async function createMemoryStore(input: {
@@ -393,8 +392,7 @@ interface SdkSessionsResource {
 }
 
 function getSessions(client: Anthropic): SdkSessionsResource {
-  return (client as unknown as { beta: { sessions: SdkSessionsResource } }).beta
-    .sessions;
+  return (client as unknown as { beta: { sessions: SdkSessionsResource } }).beta.sessions;
 }
 
 function toSdkOutgoing(event: OutgoingSessionEvent): Record<string, unknown> {
@@ -417,9 +415,7 @@ function toSdkOutgoing(event: OutgoingSessionEvent): Record<string, unknown> {
     }
     case "user.custom_tool_result": {
       const text =
-        typeof event.content === "string"
-          ? event.content
-          : JSON.stringify(event.content);
+        typeof event.content === "string" ? event.content : JSON.stringify(event.content);
       const out: Record<string, unknown> = {
         type: "user.custom_tool_result",
         custom_tool_use_id: event.customToolUseId,
@@ -431,10 +427,7 @@ function toSdkOutgoing(event: OutgoingSessionEvent): Record<string, unknown> {
   }
 }
 
-export function mapIncomingEvent(
-  raw: unknown,
-  sessionId: SessionId,
-): IncomingSessionEvent {
+export function mapIncomingEvent(raw: unknown, sessionId: SessionId): IncomingSessionEvent {
   const rec = asRecord(raw);
   if (!rec) {
     return { type: "other", sessionId, eventId: "", rawType: "", raw };
@@ -497,9 +490,7 @@ export function mapIncomingEvent(
   }
 }
 
-export async function createSession(
-  input: CreateSessionInput,
-): Promise<CreatedSession> {
+export async function createSession(input: CreateSessionInput): Promise<CreatedSession> {
   const params: {
     agent: string;
     environment_id: string;
@@ -543,10 +534,7 @@ export async function createSession(
   return { sessionId: rec.id };
 }
 
-export async function sendEvent(
-  sessionId: SessionId,
-  event: OutgoingSessionEvent,
-): Promise<void> {
+export async function sendEvent(sessionId: SessionId, event: OutgoingSessionEvent): Promise<void> {
   await withRetry(() =>
     getSessions(getAnthropic()).events.send(sessionId, {
       events: [toSdkOutgoing(event)],
@@ -570,19 +558,16 @@ export async function postCustomToolResult(
   await sendEvent(sessionId, event);
 }
 
-export function streamSession(
-  sessionId: SessionId,
-): AsyncIterable<IncomingSessionEvent> {
+export function streamSession(sessionId: SessionId): AsyncIterable<IncomingSessionEvent> {
   return {
     [Symbol.asyncIterator]() {
       let inner: AsyncIterator<unknown> | null = null;
       return {
         async next(): Promise<IteratorResult<IncomingSessionEvent>> {
           if (!inner) {
-            const stream = await getSessions(getAnthropic()).events.stream(
-              sessionId,
-              { betas: [MANAGED_AGENTS_BETA] },
-            );
+            const stream = await getSessions(getAnthropic()).events.stream(sessionId, {
+              betas: [MANAGED_AGENTS_BETA],
+            });
             inner = (stream as AsyncIterable<unknown>)[Symbol.asyncIterator]();
           }
           const next = await inner.next();

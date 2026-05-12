@@ -47,10 +47,8 @@ function loadAgentYaml(): AgentYaml {
   const name = rec.name;
   const model = rec.model;
   const system_prompt = rec.system_prompt;
-  if (typeof name !== "string" || name.length === 0)
-    throw new Error("agent.yaml: name");
-  if (typeof model !== "string" || model.length === 0)
-    throw new Error("agent.yaml: model");
+  if (typeof name !== "string" || name.length === 0) throw new Error("agent.yaml: name");
+  if (typeof model !== "string" || model.length === 0) throw new Error("agent.yaml: model");
   if (typeof system_prompt !== "string" || system_prompt.length === 0)
     throw new Error("agent.yaml: system_prompt");
   return { name, model, system_prompt };
@@ -101,10 +99,7 @@ async function ensureEnvironment(client: Anthropic): Promise<string> {
       beta: {
         environments: {
           create: (p: Record<string, unknown>) => Promise<{ id: string; name: string }>;
-          update: (
-            id: string,
-            p: Record<string, unknown>,
-          ) => Promise<{ id: string; name: string }>;
+          update: (id: string, p: Record<string, unknown>) => Promise<{ id: string; name: string }>;
           list: (p?: Record<string, unknown>) => AsyncIterable<{ id: string; name: string }>;
         };
       };
@@ -133,11 +128,7 @@ async function ensureEnvironment(client: Anthropic): Promise<string> {
     },
   };
 
-  const existing = await findByField(
-    envs.list({ betas: [BETA] }),
-    "name",
-    ENVIRONMENT_NAME,
-  );
+  const existing = await findByField(envs.list({ betas: [BETA] }), "name", ENVIRONMENT_NAME);
   if (existing) {
     // Ensure config is correct (idempotent update).
     const updated = await envs.update(existing.id, {
@@ -168,10 +159,7 @@ async function ensureVault(client: Anthropic, falKey: string): Promise<string> {
             display_name: string;
           }>;
           credentials: {
-            create: (
-              vaultId: string,
-              params: Record<string, unknown>,
-            ) => Promise<{ id: string }>;
+            create: (vaultId: string, params: Record<string, unknown>) => Promise<{ id: string }>;
             list: (
               vaultId: string,
               params?: Record<string, unknown>,
@@ -183,11 +171,7 @@ async function ensureVault(client: Anthropic, falKey: string): Promise<string> {
   ).beta.vaults;
 
   let vaultId: string;
-  const existing = await findByField(
-    vaults.list({ betas: [BETA] }),
-    "display_name",
-    VAULT_NAME,
-  );
+  const existing = await findByField(vaults.list({ betas: [BETA] }), "display_name", VAULT_NAME);
   if (existing) {
     log(`vault reused: ${existing.id}`);
     vaultId = existing.id;
@@ -340,9 +324,7 @@ async function main(): Promise<void> {
 
 if (import.meta.main) {
   main().catch((err) => {
-    process.stderr.write(
-      `[setup] error: ${err instanceof Error ? err.message : String(err)}\n`,
-    );
+    process.stderr.write(`[setup] error: ${err instanceof Error ? err.message : String(err)}\n`);
     if (err instanceof Error && err.stack) {
       process.stderr.write(`${err.stack}\n`);
     }

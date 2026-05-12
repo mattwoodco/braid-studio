@@ -4,8 +4,8 @@
  * with crossfades, then +faststart for streaming.
  */
 import { spawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 const WIDTH = 1280;
@@ -43,9 +43,7 @@ async function run(cmd: string, args: string[]): Promise<SpawnResult> {
       stderr += c.toString("utf8");
     });
     proc.on("error", reject);
-    proc.on("close", (code) =>
-      resolve({ exitCode: code ?? 1, stdout, stderr }),
-    );
+    proc.on("close", (code) => resolve({ exitCode: code ?? 1, stdout, stderr }));
   });
 }
 
@@ -59,9 +57,7 @@ async function downloadTo(url: string, path: string): Promise<void> {
   await writeFile(path, buf);
 }
 
-export async function composeClips(
-  input: ComposeInput,
-): Promise<ComposeResult> {
+export async function composeClips(input: ComposeInput): Promise<ComposeResult> {
   const fps = input.fps ?? FPS;
   const crossfadeMs = input.crossfadeMs ?? DEFAULT_CROSSFADE_MS;
   const crossfadeSec = crossfadeMs / 1000;
@@ -144,9 +140,7 @@ export async function composeClips(
       filterParts.push(
         `${prevV}[${i}:v]xfade=transition=fade:duration=${crossfadeSec}:offset=${offset.toFixed(3)}[${vOut}]`,
       );
-      filterParts.push(
-        `${prevA}[${i}:a]acrossfade=d=${crossfadeSec}[${aOut}]`,
-      );
+      filterParts.push(`${prevA}[${i}:a]acrossfade=d=${crossfadeSec}[${aOut}]`);
       prevV = `[${vOut}]`;
       prevA = `[${aOut}]`;
     }
@@ -195,14 +189,7 @@ export async function composeClips(
 }
 
 export async function ffprobeDuration(path: string): Promise<number> {
-  const r = await run("ffprobe", [
-    "-v",
-    "quiet",
-    "-print_format",
-    "json",
-    "-show_format",
-    path,
-  ]);
+  const r = await run("ffprobe", ["-v", "quiet", "-print_format", "json", "-show_format", path]);
   if (r.exitCode !== 0) {
     throw new Error(`ffprobe failed: ${r.stderr.slice(-400)}`);
   }

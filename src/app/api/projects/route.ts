@@ -1,15 +1,15 @@
-/**
- * POST /api/projects     create a new project (memory store)
- * GET  /api/projects     list projects (memory stores filtered by metadata)
- */
-import { NextResponse } from "next/server";
-import { z } from "zod";
 import {
   createMemory,
   createMemoryStore,
   listMemoryStores,
   updateMemoryStoreMetadata,
 } from "@/lib/anthropic";
+/**
+ * POST /api/projects     create a new project (memory store)
+ * GET  /api/projects     list projects (memory stores filtered by metadata)
+ */
+import { NextResponse } from "next/server";
+import { z } from "zod";
 
 export const dynamic = "force-dynamic";
 
