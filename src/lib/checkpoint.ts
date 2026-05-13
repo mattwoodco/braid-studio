@@ -41,6 +41,9 @@ export type PhaseCState = {
   durationSeconds?: number;
 };
 
+export type Gate = "G1" | "G2" | "G3" | "G4" | "G5" | "G6";
+export type GateState = "pending" | "passed" | "halted";
+
 export type BriefCheckpoint = {
   briefId: string;
   storeId: string;
@@ -49,10 +52,58 @@ export type BriefCheckpoint = {
   phaseA: PhaseAState;
   phaseB: PhaseBState;
   phaseC: PhaseCState;
+  cumulativeSpendUsd: number;
+  gateState: Record<Gate, GateState>;
 };
 
 export function checkpointPath(runDir: string, briefId: string): string {
   return resolvePath(runDir, briefId, "checkpoint.json");
+}
+
+function defaultGateState(): Record<Gate, GateState> {
+  return {
+    G1: "pending",
+    G2: "pending",
+    G3: "pending",
+    G4: "pending",
+    G5: "pending",
+    G6: "pending",
+  };
+}
+
+type RawCheckpoint = Omit<Partial<BriefCheckpoint>, "gateState"> & {
+  briefId: string;
+  storeId: string;
+  startedAt: string;
+  updatedAt: string;
+  phaseA: PhaseAState;
+  phaseB: PhaseBState;
+  phaseC: PhaseCState;
+  gateState?: Partial<Record<Gate, GateState>>;
+};
+
+function normalizeCheckpoint(raw: RawCheckpoint): BriefCheckpoint {
+  const gates = defaultGateState();
+  if (raw.gateState) {
+    for (const k of Object.keys(gates) as Gate[]) {
+      const v = raw.gateState[k];
+      if (v === "pending" || v === "passed" || v === "halted") {
+        gates[k] = v;
+      }
+    }
+  }
+  return {
+    briefId: raw.briefId,
+    storeId: raw.storeId,
+    startedAt: raw.startedAt,
+    updatedAt: raw.updatedAt,
+    phaseA: raw.phaseA,
+    phaseB: raw.phaseB,
+    phaseC: raw.phaseC,
+    cumulativeSpendUsd:
+      typeof raw.cumulativeSpendUsd === "number" ? raw.cumulativeSpendUsd : 0,
+    gateState: gates,
+  };
 }
 
 export async function loadCheckpoint(
@@ -61,7 +112,8 @@ export async function loadCheckpoint(
 ): Promise<BriefCheckpoint | null> {
   try {
     const txt = await readFile(checkpointPath(runDir, briefId), "utf8");
-    return JSON.parse(txt) as BriefCheckpoint;
+    const parsed = JSON.parse(txt) as RawCheckpoint;
+    return normalizeCheckpoint(parsed);
   } catch {
     return null;
   }
@@ -89,5 +141,27 @@ export function freshCheckpoint(briefId: string, storeId: string): BriefCheckpoi
     phaseA: { status: "pending" },
     phaseB: { status: "pending" },
     phaseC: { status: "pending" },
+    cumulativeSpendUsd: 0,
+    gateState: defaultGateState(),
+  };
+}
+
+export function setGateState(
+  cp: BriefCheckpoint,
+  gate: Gate,
+  state: GateState,
+): BriefCheckpoint {
+  return {
+    ...cp,
+    gateState: { ...cp.gateState, [gate]: state },
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+export function addSpend(cp: BriefCheckpoint, usd: number): BriefCheckpoint {
+  return {
+    ...cp,
+    cumulativeSpendUsd: cp.cumulativeSpendUsd + usd,
+    updatedAt: new Date().toISOString(),
   };
 }
