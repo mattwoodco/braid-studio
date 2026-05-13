@@ -1,0 +1,1 @@
+- unit 4 casting subagent: src/lib/phases/casting.ts + test; CharacterCard schema scaffold in src/lib/cards.ts; tests=pass branch=batch/casting
