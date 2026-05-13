@@ -1,0 +1,1 @@
+- UNIT 3 cards: zod v4 schemas (Character/Setting/Shot) + bible helpers (writeCharacter/writeSetting/writeShots/readBible) on memory-store paths /bible/characters,/bible/settings,/bible/shots. 17/17 tests pass. branch=batch/cards
