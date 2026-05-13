@@ -52,11 +52,13 @@ import {
 } from "@/lib/checkpoint";
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, resolve as resolvePath } from "node:path";
+import { debugLog, withTiming } from "@/lib/debug-log";
 
 const RUN_ID =
   process.env.BRAID_RUN_ID ??
   `pipev3-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}`;
 const OUT_ROOT = resolvePath(process.cwd(), "data/full-pipeline-v3", RUN_ID);
+const DEBUG_DIR = process.env.BRAID_DEBUG_DIR ?? OUT_ROOT;
 
 const SEATS = 3;
 const VARIANTS_PER_ITER = 5;
@@ -155,34 +157,50 @@ async function generateScriptVariants(input: {
       ].join("\n")
     : `Generate ${input.k} maximally DIFFERENT variants. Vary: hook type, tonal register, opening focal length, narrative arc, and emotional centre.`;
 
-  const msg = await anth().messages.create({
-    model: "claude-sonnet-4-5",
-    max_tokens: 4000,
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: [
-              `Brief: ${input.brief.brief}`,
-              `Format: ${input.brief.format}`,
-              `Target shots: ${input.brief.shotCount}`,
-              `Genre/angle: ${input.brief.genre} / ${input.brief.angle}`,
-              "",
-              directive,
-              "",
-              `Return ONLY a JSON array of ${input.k} variant objects matching:`,
-              `[${JSON.stringify(exemplar)}]`,
-              "",
-              "Each scene.description is a SHOOTABLE prompt for text-to-video: concrete subject, camera, lighting, motion, action. Each scene ~4-7s.",
-              "n is the variant index 0..K-1. No markdown, no code fences.",
-            ].join("\n"),
-          },
-        ],
-      },
-    ],
-  });
+  const { result: msg, durMs: scriptGenDurMs } = await withTiming(() =>
+    anth().messages.create({
+      model: "claude-sonnet-4-5",
+      max_tokens: 4000,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: [
+                `Brief: ${input.brief.brief}`,
+                `Format: ${input.brief.format}`,
+                `Target shots: ${input.brief.shotCount}`,
+                `Genre/angle: ${input.brief.genre} / ${input.brief.angle}`,
+                "",
+                directive,
+                "",
+                `Return ONLY a JSON array of ${input.k} variant objects matching:`,
+                `[${JSON.stringify(exemplar)}]`,
+                "",
+                "Each scene.description is a SHOOTABLE prompt for text-to-video: concrete subject, camera, lighting, motion, action. Each scene ~4-7s.",
+                "n is the variant index 0..K-1. No markdown, no code fences.",
+              ].join("\n"),
+            },
+          ],
+        },
+      ],
+    }),
+  );
+  await debugLog(
+    {
+      ts: new Date().toISOString(),
+      briefId: input.brief.id,
+      phase: "A",
+      kind: "claude_create",
+      model: "claude-sonnet-4-5",
+      durMs: scriptGenDurMs,
+      tokensIn: msg.usage?.input_tokens,
+      tokensOut: msg.usage?.output_tokens,
+      extra: { seed: input.seedFromCritic ? "regen" : "initial", k: input.k },
+    },
+    DEBUG_DIR,
+  );
   const block = msg.content[0];
   if (!block || block.type !== "text") throw new Error("script gen no text");
   const text = block.text.trim().replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
@@ -260,6 +278,16 @@ async function phaseA(brief: Brief, cp: BriefCheckpoint): Promise<ScriptVariant>
     cp.phaseA.history!.push({ version, winnerN, winnerScore, perCand });
     await saveCheckpoint(OUT_ROOT, cp);
     log(stamp(), `[A:${brief.id}] ${version} winner=variant${winnerN} score=${winnerScore.toFixed(2)}`);
+    await debugLog(
+      {
+        ts: new Date().toISOString(),
+        briefId: brief.id,
+        phase: "A",
+        kind: "gate_verdict",
+        extra: { version, winnerN, winnerScore, perCand },
+      },
+      DEBUG_DIR,
+    );
 
     if (winnerScore >= CONVERGED_OVERALL) break;
     if (prevWinner >= 0 && winnerScore - prevWinner < 0.02) break;
@@ -326,8 +354,19 @@ async function generateStillBestOf(input: {
   version: string;
 }): Promise<{ url: string; localPath: string }> {
   const labels = "ABCDEFGH";
-  const results = await Promise.all(
-    Array.from({ length: input.n }, () => submitTextToImage({ prompt: input.prompt })),
+  const { result: results, durMs: falImageDurMs } = await withTiming(() =>
+    Promise.all(Array.from({ length: input.n }, () => submitTextToImage({ prompt: input.prompt }))),
+  );
+  await debugLog(
+    {
+      ts: new Date().toISOString(),
+      briefId: input.workDir.split("/").at(-3) ?? "unknown",
+      phase: "B",
+      kind: "fal_image_submit",
+      durMs: falImageDurMs,
+      extra: { sceneIndex: input.sceneIndex, version: input.version, n: input.n },
+    },
+    DEBUG_DIR,
   );
   const paths = results.map(
     (_, i) => `${input.workDir}/${input.version}-scene${input.sceneIndex}-${labels[i]}.jpg`,
@@ -430,6 +469,16 @@ async function phaseB(brief: Brief, cp: BriefCheckpoint): Promise<StoryShot[]> {
     await saveCheckpoint(OUT_ROOT, cp);
     smoothing.push({ allLocked: locked.length === shots.length, overall });
     log(stamp(), `[B:${brief.id}] ${version}: overall ${overall.toFixed(2)} locked ${locked.length}/${shots.length}`);
+    await debugLog(
+      {
+        ts: new Date().toISOString(),
+        briefId: brief.id,
+        phase: "B",
+        kind: "gate_verdict",
+        extra: { version, overall, locked: locked.length, total: shots.length, perCand },
+      },
+      DEBUG_DIR,
+    );
 
     // Efficient exit — no more work to do
     if (noWorkRemaining({ locked, totalShots: shots.length })) {
@@ -499,33 +548,49 @@ async function captionAsVideoPrompt(input: {
   sceneIndex: number;
 }): Promise<string> {
   const img = await readFile(input.stillPath);
-  const msg = await anth().messages.create({
-    model: "claude-sonnet-4-5",
-    max_tokens: 350,
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: [
-              `BRIEF: ${input.brief.brief}`,
-              `Genre/angle: ${input.brief.genre} — ${input.brief.angle}`,
-              "",
-              `Look at the storyboard image for scene ${input.sceneIndex}.`,
-              "Write a SHOOTABLE text-to-video prompt for a 5-second cinematic clip matching this image:",
-              "  - subject, framing, lighting, palette, ONE camera motion, ONE specific action.",
-              "  - Concrete. No quotes. ≤ 60 words.",
-            ].join("\n"),
-          },
-          {
-            type: "image",
-            source: { type: "base64", media_type: "image/jpeg", data: img.toString("base64") },
-          },
-        ],
-      },
-    ],
-  });
+  const { result: msg, durMs: captionDurMs } = await withTiming(() =>
+    anth().messages.create({
+      model: "claude-sonnet-4-5",
+      max_tokens: 350,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: [
+                `BRIEF: ${input.brief.brief}`,
+                `Genre/angle: ${input.brief.genre} — ${input.brief.angle}`,
+                "",
+                `Look at the storyboard image for scene ${input.sceneIndex}.`,
+                "Write a SHOOTABLE text-to-video prompt for a 5-second cinematic clip matching this image:",
+                "  - subject, framing, lighting, palette, ONE camera motion, ONE specific action.",
+                "  - Concrete. No quotes. ≤ 60 words.",
+              ].join("\n"),
+            },
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/jpeg", data: img.toString("base64") },
+            },
+          ],
+        },
+      ],
+    }),
+  );
+  await debugLog(
+    {
+      ts: new Date().toISOString(),
+      briefId: input.brief.id,
+      phase: "C",
+      kind: "claude_create",
+      model: "claude-sonnet-4-5",
+      durMs: captionDurMs,
+      tokensIn: msg.usage?.input_tokens,
+      tokensOut: msg.usage?.output_tokens,
+      extra: { sceneIndex: input.sceneIndex },
+    },
+    DEBUG_DIR,
+  );
   const block = msg.content[0];
   if (!block || block.type !== "text") throw new Error("caption no text");
   return block.text.trim().replace(/^["']|["']$/g, "");
@@ -561,9 +626,23 @@ async function phaseC(brief: Brief, cp: BriefCheckpoint, shots: StoryShot[]): Pr
   const videoUrls =
     cp.phaseC.videoUrls && cp.phaseC.videoUrls.length === prompts.length
       ? cp.phaseC.videoUrls
-      : (await Promise.all(prompts.map((p) => submitTextToVideo({ prompt: p })))).map(
-          (r) => r.videoUrl,
-        );
+      : await (async () => {
+          const { result: videoResults, durMs: videoSubmitDurMs } = await withTiming(() =>
+            Promise.all(prompts.map((p) => submitTextToVideo({ prompt: p }))),
+          );
+          await debugLog(
+            {
+              ts: new Date().toISOString(),
+              briefId: brief.id,
+              phase: "C",
+              kind: "fal_video_submit",
+              durMs: videoSubmitDurMs,
+              extra: { promptCount: prompts.length },
+            },
+            DEBUG_DIR,
+          );
+          return videoResults.map((r) => r.videoUrl);
+        })();
   cp.phaseC.videoUrls = videoUrls;
   await saveCheckpoint(OUT_ROOT, cp);
 
@@ -615,6 +694,19 @@ async function withSdkRetry<T>(fn: () => Promise<T>, tag: string): Promise<T> {
       if (!transient || attempt >= delays.length) throw err;
       const d = delays[attempt] ?? 1000;
       log(stamp(), `[${tag}] transient error attempt ${attempt + 1}/${delays.length + 1} — sleeping ${d}ms: ${msg.slice(0, 200)}`);
+      const briefIdFromTag = tag.split("/").at(-1) ?? tag;
+      const phaseFromTag = tag.split("/")[0] ?? "unknown";
+      await debugLog(
+        {
+          ts: new Date().toISOString(),
+          briefId: briefIdFromTag,
+          phase: phaseFromTag,
+          kind: "retry",
+          retry: attempt + 1,
+          extra: { tag, delayMs: d, error: msg.slice(0, 200) },
+        },
+        DEBUG_DIR,
+      ).catch(() => undefined);
       await new Promise((r) => setTimeout(r, d));
     }
   }
@@ -710,3 +802,5 @@ main().catch((err) => {
   console.error("[pipe3] failed:", err);
   process.exit(1);
 });
+
+export { processBrief };
