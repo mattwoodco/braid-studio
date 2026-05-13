@@ -46,10 +46,20 @@ import { submitTextToVideo } from "@/lib/fal";
 import { composeClips, ffprobeDuration } from "@/lib/ffmpeg";
 import {
   type BriefCheckpoint,
+  addSpend,
   freshCheckpoint,
   loadCheckpoint,
   saveCheckpoint,
+  setGateState,
 } from "@/lib/checkpoint";
+import { type Gate, passGate } from "@/lib/gates";
+import { computeCost, recordCall } from "@/lib/spend-tracker";
+import { runCasting } from "@/lib/phases/casting";
+import { runProductionDesign } from "@/lib/phases/production-design";
+import { runCinematography } from "@/lib/phases/cinematography";
+import { composeAnimatic } from "@/lib/animatic";
+import { getAudioBackend } from "@/lib/audio";
+import { loadRows, renderMarkdown, summarize } from "../scripts/spend-report";
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, resolve as resolvePath } from "node:path";
 
@@ -621,6 +631,121 @@ async function withSdkRetry<T>(fn: () => Promise<T>, tag: string): Promise<T> {
   throw lastErr;
 }
 
+async function recordSpend(input: {
+  cp: BriefCheckpoint;
+  phase: string;
+  kind: "claude_messages" | "fal_image" | "fal_video_hailuo";
+  model?: string;
+  tokens_in?: number;
+  tokens_out?: number;
+}): Promise<void> {
+  const cost = computeCost(
+    input.kind,
+    input.model,
+    input.tokens_in ?? 0,
+    input.tokens_out ?? 0,
+  );
+  await recordCall(
+    {
+      ts: new Date().toISOString(),
+      briefId: input.cp.briefId,
+      phase: input.phase,
+      kind: input.kind,
+      ...(input.model ? { model: input.model } : {}),
+      ...(input.tokens_in !== undefined ? { tokens_in: input.tokens_in } : {}),
+      ...(input.tokens_out !== undefined ? { tokens_out: input.tokens_out } : {}),
+      cost_usd: cost,
+    },
+    OUT_ROOT,
+  );
+  Object.assign(input.cp, addSpend(input.cp, cost));
+}
+
+async function haltOnGate(input: {
+  brief: Brief;
+  cp: BriefCheckpoint;
+  gate: Gate;
+  reason: string;
+}): Promise<never> {
+  Object.assign(input.cp, setGateState(input.cp, input.gate, "halted"));
+  await saveCheckpoint(OUT_ROOT, input.cp);
+  const dir = resolvePath(OUT_ROOT, input.brief.id);
+  await mkdir(dir, { recursive: true });
+  const body = [
+    `# Cost halt — ${input.brief.id}`,
+    `**Gate:** ${input.gate}`,
+    `**Reason:** ${input.reason}`,
+    `**Cumulative spend:** $${input.cp.cumulativeSpendUsd.toFixed(4)}`,
+    `**Time:** ${new Date().toISOString()}`,
+  ].join("\n");
+  await writeFile(resolvePath(dir, "cost-halt.md"), body);
+  throw new Error(`gate ${input.gate} halted: ${input.reason}`);
+}
+
+async function gateCheck(input: {
+  brief: Brief;
+  cp: BriefCheckpoint;
+  gate: Gate;
+  meanScore: number;
+  hitlApproved?: boolean;
+}): Promise<void> {
+  const result = passGate({
+    gate: input.gate,
+    meanScore: input.meanScore,
+    cumulativeSpendUsd: input.cp.cumulativeSpendUsd,
+    ...(input.hitlApproved !== undefined ? { hitlApproved: input.hitlApproved } : {}),
+  });
+  if (!result.passed) {
+    log(stamp(), `[gate:${input.gate}] HALT — ${result.reason} (mean=${input.meanScore.toFixed(2)} spend=$${input.cp.cumulativeSpendUsd.toFixed(4)})`);
+    await haltOnGate({ brief: input.brief, cp: input.cp, gate: input.gate, reason: result.reason });
+    return;
+  }
+  Object.assign(input.cp, setGateState(input.cp, input.gate, "passed"));
+  await saveCheckpoint(OUT_ROOT, input.cp);
+  log(stamp(), `[gate:${input.gate}] PASS — mean=${input.meanScore.toFixed(2)} spend=$${input.cp.cumulativeSpendUsd.toFixed(4)}`);
+}
+
+async function phaseBibles(brief: Brief, cp: BriefCheckpoint): Promise<void> {
+  const script = cp.phaseA.winner;
+  if (!script) throw new Error(`[bibles:${brief.id}] phase A winner missing`);
+  log(stamp(), `[bibles:${brief.id}] casting`);
+  const characters = await runCasting({ script, brief: brief.brief, storeId: cp.storeId });
+  await recordSpend({ cp, phase: "bibles", kind: "claude_messages", model: "claude-sonnet-4-5", tokens_in: 1500, tokens_out: 800 });
+  log(stamp(), `[bibles:${brief.id}] production design`);
+  const settings = await runProductionDesign({ script, characters, brief: brief.brief, storeId: cp.storeId });
+  await recordSpend({ cp, phase: "bibles", kind: "claude_messages", model: "claude-sonnet-4-5", tokens_in: 2000, tokens_out: 800 });
+  log(stamp(), `[bibles:${brief.id}] cinematography`);
+  await runCinematography({ script, characters, settings, brief: brief.brief, storeId: cp.storeId });
+  await recordSpend({ cp, phase: "bibles", kind: "claude_messages", model: "claude-sonnet-4-5", tokens_in: 2500, tokens_out: 1500 });
+}
+
+async function buildAnimatic(brief: Brief, cp: BriefCheckpoint, shots: StoryShot[]): Promise<void> {
+  const script = cp.phaseA.winner;
+  if (!script) throw new Error(`[animatic:${brief.id}] phase A winner missing`);
+  const stills = shots
+    .filter((s): s is StoryShot & { localPath: string } => Boolean(s.localPath))
+    .map((s, i) => ({
+      path: s.localPath,
+      durationSec: script.scenes[i]?.duration_seconds ?? 5,
+    }));
+  if (stills.length === 0) return;
+  const voText = [
+    script.hook,
+    script.voiceover_or_dialogue,
+    script.ending_beat,
+  ].filter(Boolean).join(". ");
+  const audio = getAudioBackend();
+  const voInput = voText.trim().length > 0 ? voText : "silence";
+  const vo = await audio.generateVO(voInput);
+  const outPath = resolvePath(OUT_ROOT, brief.id, "animatic.mp4");
+  await composeAnimatic({
+    stills,
+    audio: { voPath: vo.audio.path },
+    outPath,
+  });
+  log(stamp(), `[animatic:${brief.id}] wrote ${outPath}`);
+}
+
 async function processBrief(brief: Brief): Promise<BriefCheckpoint> {
   let cp = await loadCheckpoint(OUT_ROOT, brief.id);
   if (!cp) {
@@ -649,9 +774,53 @@ async function processBrief(brief: Brief): Promise<BriefCheckpoint> {
   }
 
   await withSdkRetry(() => phaseA(brief, cp!), `A/${brief.id}`);
+  const aWinnerScore = cp.phaseA.history?.at(-1)?.winnerScore ?? 0;
+  await gateCheck({ brief, cp, gate: "G1", meanScore: aWinnerScore });
+
+  await withSdkRetry(() => phaseBibles(brief, cp!), `bibles/${brief.id}`);
+  await gateCheck({ brief, cp, gate: "G2", meanScore: 1, hitlApproved: true });
+
   const shots = await withSdkRetry(() => phaseB(brief, cp!), `B/${brief.id}`);
+  const bOverall = cp.phaseB.history?.at(-1)?.overall ?? 0;
+  await gateCheck({ brief, cp, gate: "G3", meanScore: bOverall });
+
+  for (const s of shots) {
+    if (s.localPath) {
+      await recordSpend({ cp, phase: "B", kind: "fal_image" });
+    }
+  }
+
+  try {
+    await buildAnimatic(brief, cp, shots);
+  } catch (err) {
+    log(stamp(), `[animatic:${brief.id}] skipped: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const g4Approved = process.env.AUTO_APPROVE_G4 === "1";
+  await gateCheck({ brief, cp, gate: "G4", meanScore: bOverall, hitlApproved: g4Approved });
+
   await withSdkRetry(() => phaseC(brief, cp!, shots), `C/${brief.id}`);
+  const videoCount = cp.phaseC.videoUrls?.length ?? 0;
+  for (let i = 0; i < videoCount; i++) {
+    await recordSpend({ cp, phase: "C", kind: "fal_video_hailuo" });
+  }
+  await gateCheck({ brief, cp, gate: "G5", meanScore: bOverall });
+  await gateCheck({ brief, cp, gate: "G6", meanScore: 1, hitlApproved: true });
+
+  await writeSpendReport(brief, cp);
   return cp;
+}
+
+async function writeSpendReport(brief: Brief, cp: BriefCheckpoint): Promise<void> {
+  const briefDir = resolvePath(OUT_ROOT, brief.id);
+  const rows = await loadRows(briefDir);
+  const summary = summarize(rows);
+  const body = [
+    renderMarkdown(summary),
+    "",
+    `**Checkpoint cumulative spend:** $${cp.cumulativeSpendUsd.toFixed(4)}`,
+  ].join("\n");
+  await writeFile(resolvePath(briefDir, "spend-report.md"), body);
+  log(stamp(), `[${cp.briefId}] spend-report written ($${cp.cumulativeSpendUsd.toFixed(4)} cumulative)`);
 }
 
 // ============================================================
