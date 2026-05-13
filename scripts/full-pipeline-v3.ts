@@ -659,6 +659,11 @@ async function processBrief(brief: Brief): Promise<BriefCheckpoint> {
 // ============================================================
 
 async function main(): Promise<void> {
+  if (process.env.BRAID_REAL_AUDIO === "1") {
+    const { realBackend } = await import("@/lib/audio-real");
+    const { setAudioBackend } = await import("@/lib/audio");
+    setAudioBackend(realBackend);
+  }
   await mkdir(OUT_ROOT, { recursive: true });
   log("OUT_ROOT =", OUT_ROOT);
   const briefs = selectBriefs();
