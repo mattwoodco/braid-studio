@@ -41,6 +41,7 @@ import {
   renderAspectRubric,
 } from "@/lib/craft-rubrics";
 import { adaptiveN, briefGroundedJudge, minimalRewrite } from "@/lib/claude-judge";
+import { critiqueAnimatic } from "@/lib/animatic-critique";
 import { submitTextToImage } from "@/lib/fal-image";
 import { submitTextToVideo } from "@/lib/fal";
 import { composeClips, ffprobeDuration } from "@/lib/ffmpeg";
@@ -579,6 +580,14 @@ async function phaseC(brief: Brief, cp: BriefCheckpoint, shots: StoryShot[]): Pr
   cp.phaseC.durationSeconds = duration;
   cp.phaseC.status = "done";
   await saveCheckpoint(OUT_ROOT, cp);
+
+  if (process.env.BRAID_ANIMATIC_CRITIQUE === "1") {
+    const animaticVerdict = await critiqueAnimatic({ brief: brief.brief, mp4Path });
+    log(stamp(), `[${brief.id}] animatic critique overall=${animaticVerdict.overall.toFixed(3)}`);
+    for (const dim of animaticVerdict.dims) {
+      log(stamp(), `[${brief.id}]   ${dim.name}: ${dim.score.toFixed(2)} — ${dim.note}`);
+    }
+  }
 
   // Write deliverable.
   const lines: string[] = [];
