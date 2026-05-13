@@ -18,26 +18,26 @@ async function fetchProjects(): Promise<ProjectRow[]> {
 export default async function HomePage(): Promise<React.JSX.Element> {
   const projects = await fetchProjects();
   return (
-    <main className="max-w-3xl mx-auto p-8 space-y-8">
-      <h1 className="text-2xl font-bold">braid-studio</h1>
-      <p className="text-neutral-400 text-sm">
-        Granular video creation. Pick a project or create one.
-      </p>
+    <main className="max-w-[64ch] mx-auto p-8 space-y-10 text-base leading-relaxed">
+      <header className="space-y-1">
+        <h1 className="text-3xl font-semibold tracking-tight">braid-studio</h1>
+        <p className="text-neutral-500">Granular video creation.</p>
+      </header>
       <NewProjectForm />
-      <section>
-        <h2 className="text-lg font-semibold mb-3">Projects</h2>
+      <section className="space-y-3">
+        <h2 className="text-sm uppercase tracking-wide text-neutral-500">Projects</h2>
         {projects.length === 0 ? (
-          <p className="text-neutral-500 text-sm">No projects yet.</p>
+          <p className="text-neutral-500">No projects yet.</p>
         ) : (
-          <ul className="space-y-2">
+          <ul className="space-y-1">
             {projects.map((p) => (
               <li key={p.storeId}>
                 <a
                   href={`/projects/${p.storeId}`}
-                  className="block border border-neutral-800 rounded p-3 hover:bg-neutral-900"
+                  className="block py-2 text-neutral-100 hover:text-white"
                 >
-                  <div className="font-medium">{p.name}</div>
-                  <div className="text-xs text-neutral-500">{p.storeId}</div>
+                  <div className="truncate">{p.name}</div>
+                  <div className="text-xs text-neutral-600 font-mono">{p.storeId}</div>
                 </a>
               </li>
             ))}

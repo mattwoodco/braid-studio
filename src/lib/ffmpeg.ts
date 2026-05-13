@@ -82,12 +82,23 @@ export async function composeClips(input: ComposeInput): Promise<ComposeResult> 
     const src = downloaded[i];
     if (!src) continue;
     const dst = join(scratchDir, `norm-${i + 1}.mp4`);
+    // Always synthesize silent audio so clips without source audio (some FAL
+    // models return video-only mp4s) still normalize uniformly. We drop any
+    // source audio — FAL clips don't carry meaningful audio anyway.
     const args = [
       "-y",
       "-i",
       src,
+      "-f",
+      "lavfi",
+      "-i",
+      "anullsrc=channel_layout=stereo:sample_rate=48000",
       "-vf",
       `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps}`,
+      "-map",
+      "0:v:0",
+      "-map",
+      "1:a:0",
       "-c:v",
       "libx264",
       "-preset",

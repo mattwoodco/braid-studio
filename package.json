@@ -11,7 +11,8 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "setup": "bun infra/setup.ts",
-    "acceptance": "bun scripts/acceptance.ts"
+    "acceptance": "bun scripts/acceptance.ts",
+    "test": "bun test"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.95.1",

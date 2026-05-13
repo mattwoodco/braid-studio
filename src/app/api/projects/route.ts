@@ -4,6 +4,7 @@ import {
   listMemoryStores,
   updateMemoryStoreMetadata,
 } from "@/lib/anthropic";
+import { RUBRIC_TEMPLATE } from "@/lib/rubric";
 /**
  * POST /api/projects     create a new project (memory store)
  * GET  /api/projects     list projects (memory stores filtered by metadata)
@@ -33,28 +34,39 @@ export async function POST(req: Request): Promise<Response> {
     );
   }
   const { name, brief } = parsed.data;
-  const store = await createMemoryStore({
-    name,
-    description: brief ?? name,
-  });
-  await updateMemoryStoreMetadata(store.id, {
-    braid_studio: "v1",
-    project_name: name,
-  });
-  await createMemory(store.id, {
-    path: "/memory/manifest.json",
-    content: JSON.stringify(
-      { name, brief: brief ?? null, created_at: new Date().toISOString() },
-      null,
-      2,
-    ),
-  });
-  await createMemory(store.id, {
-    path: "/memory/rubric.md",
-    content:
-      "# Rubric\n\nProduce an mp4 reflecting the brief. Each shot must be vivid. Final compose must verify with ffprobe and end with the file uploaded to a public URL.\n",
-  });
-  return NextResponse.json({ storeId: store.id, name });
+  try {
+    const description = (brief ?? name)
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control chars
+      .replace(/[\x00-\x1f\x7f]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 1000);
+    const store = await createMemoryStore({
+      name,
+      description,
+    });
+    await updateMemoryStoreMetadata(store.id, {
+      braid_studio: "v1",
+      project_name: name,
+    });
+    await createMemory(store.id, {
+      path: "/memory/manifest.json",
+      content: JSON.stringify(
+        { name, brief: brief ?? null, created_at: new Date().toISOString() },
+        null,
+        2,
+      ),
+    });
+    await createMemory(store.id, {
+      path: "/memory/rubric.md",
+      content: RUBRIC_TEMPLATE,
+    });
+    return NextResponse.json({ storeId: store.id, name });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[/api/projects] create failed:", message);
+    return NextResponse.json({ error: "create_failed", message }, { status: 500 });
+  }
 }
 
 export async function GET(): Promise<Response> {

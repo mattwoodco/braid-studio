@@ -296,12 +296,18 @@ export type SessionResource = {
   instructions?: string;
 };
 
+export type MultiagentCoordinatorConfig = {
+  type: "coordinator";
+  agents: Array<{ id: string; type: "self" }>;
+};
+
 export type CreateSessionInput = {
   agentId: string;
   environmentId: string;
   resources?: SessionResource[];
   vaultIds?: string[];
   title?: string;
+  multiagent?: MultiagentCoordinatorConfig;
 };
 
 export type CreatedSession = { sessionId: SessionId };
@@ -490,57 +496,91 @@ export function mapIncomingEvent(raw: unknown, sessionId: SessionId): IncomingSe
   }
 }
 
-export async function createSession(input: CreateSessionInput): Promise<CreatedSession> {
-  const params: {
-    agent: string;
-    environment_id: string;
-    resources?: Array<{
-      type: "memory_store";
-      memory_store_id: string;
-      access?: "read_only" | "read_write";
-      instructions?: string;
-    }>;
-    vault_ids?: string[];
-    title?: string;
-    betas: string[];
-  } = {
-    agent: input.agentId,
-    environment_id: input.environmentId,
-    betas: [MANAGED_AGENTS_BETA],
-  };
-  if (input.resources && input.resources.length > 0) {
-    params.resources = input.resources.map((r) => {
-      const o: {
+// ---------- Managed-Agent client seam ----------
+
+export interface ManagedAgentClient {
+  createSession(input: CreateSessionInput): Promise<CreatedSession>;
+  sendEvent(sessionId: SessionId, event: OutgoingSessionEvent): Promise<void>;
+  streamSession(sessionId: SessionId): AsyncIterable<IncomingSessionEvent>;
+}
+
+const defaultManagedAgentClient: ManagedAgentClient = {
+  async createSession(input) {
+    const params: {
+      agent: string;
+      environment_id: string;
+      resources?: Array<{
         type: "memory_store";
         memory_store_id: string;
         access?: "read_only" | "read_write";
         instructions?: string;
-      } = { type: "memory_store", memory_store_id: r.memory_store_id };
-      if (r.access !== undefined) o.access = r.access;
-      if (r.instructions !== undefined) o.instructions = r.instructions;
-      return o;
-    });
-  }
-  if (input.vaultIds && input.vaultIds.length > 0) {
-    params.vault_ids = input.vaultIds;
-  }
-  if (input.title !== undefined) params.title = input.title;
+      }>;
+      vault_ids?: string[];
+      title?: string;
+      multiagent?: MultiagentCoordinatorConfig;
+      betas: string[];
+    } = {
+      agent: input.agentId,
+      environment_id: input.environmentId,
+      betas: [MANAGED_AGENTS_BETA],
+    };
+    if (input.resources && input.resources.length > 0) {
+      params.resources = input.resources.map((r) => {
+        const o: {
+          type: "memory_store";
+          memory_store_id: string;
+          access?: "read_only" | "read_write";
+          instructions?: string;
+        } = { type: "memory_store", memory_store_id: r.memory_store_id };
+        if (r.access !== undefined) o.access = r.access;
+        if (r.instructions !== undefined) o.instructions = r.instructions;
+        return o;
+      });
+    }
+    if (input.vaultIds && input.vaultIds.length > 0) {
+      params.vault_ids = input.vaultIds;
+    }
+    if (input.title !== undefined) params.title = input.title;
+    if (input.multiagent !== undefined) params.multiagent = input.multiagent;
 
-  const raw = await withRetry(() => getSessions(getAnthropic()).create(params));
-  const rec = asRecord(raw);
-  if (!rec || typeof rec.id !== "string") {
-    throw new Error("anthropic: sessions.create returned unexpected shape");
-  }
-  return { sessionId: rec.id };
+    const raw = await withRetry(() =>
+      getSessions(getAnthropic()).create(params as Parameters<SdkSessionsResource["create"]>[0]),
+    );
+    const rec = asRecord(raw);
+    if (!rec || typeof rec.id !== "string") {
+      throw new Error("anthropic: sessions.create returned unexpected shape");
+    }
+    return { sessionId: rec.id };
+  },
+  async sendEvent(sessionId, event) {
+    await withRetry(() =>
+      getSessions(getAnthropic()).events.send(sessionId, {
+        events: [toSdkOutgoing(event)],
+        betas: [MANAGED_AGENTS_BETA],
+      }),
+    );
+  },
+  streamSession(sessionId) {
+    return streamSessionDefault(sessionId);
+  },
+};
+
+let _managedAgentClient: ManagedAgentClient = defaultManagedAgentClient;
+
+export function setManagedAgentClient(impl: ManagedAgentClient): void {
+  _managedAgentClient = impl;
+}
+
+export function resetManagedAgentClient(): void {
+  _managedAgentClient = defaultManagedAgentClient;
+}
+
+export async function createSession(input: CreateSessionInput): Promise<CreatedSession> {
+  return _managedAgentClient.createSession(input);
 }
 
 export async function sendEvent(sessionId: SessionId, event: OutgoingSessionEvent): Promise<void> {
-  await withRetry(() =>
-    getSessions(getAnthropic()).events.send(sessionId, {
-      events: [toSdkOutgoing(event)],
-      betas: [MANAGED_AGENTS_BETA],
-    }),
-  );
+  return _managedAgentClient.sendEvent(sessionId, event);
 }
 
 export async function postCustomToolResult(
@@ -558,7 +598,174 @@ export async function postCustomToolResult(
   await sendEvent(sessionId, event);
 }
 
-export function streamSession(sessionId: SessionId): AsyncIterable<IncomingSessionEvent> {
+// ---------- Dreams (research preview) ----------
+//
+// Dreams curate + deduplicate memory across past sessions. Input: a memory
+// store and up to 100 session_ids. Output: a NEW memory store (input is never
+// mutated). Useful for distilling brand voice, recurring shot patterns, and
+// client preferences from many iterative ad-revision sessions.
+//
+// The SDK (@anthropic-ai/sdk@0.95.2) does not yet expose `client.beta.dreams`,
+// so we call the REST endpoint directly with the dreaming beta header.
+
+const DREAMING_BETA = "dreaming-2026-04-21";
+const ANTHROPIC_API_BASE = "https://api.anthropic.com";
+
+export type DreamStatus = "pending" | "running" | "completed" | "failed" | "canceled";
+
+export type Dream = {
+  id: string;
+  status: DreamStatus;
+  model: string | null;
+  inputs: Array<
+    | { type: "memory_store"; memory_store_id: string }
+    | { type: "sessions"; session_ids: string[] }
+  >;
+  outputs: Array<{ type: "memory_store"; memory_store_id: string }>;
+  sessionId: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  usage: Record<string, unknown> | null;
+  raw: unknown;
+};
+
+function dreamHeaders(): Record<string, string> {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) throw new MissingAnthropicKeyError();
+  return {
+    "content-type": "application/json",
+    "x-api-key": key,
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": `${MANAGED_AGENTS_BETA},${DREAMING_BETA}`,
+  };
+}
+
+function toDream(raw: unknown): Dream {
+  const rec = asRecord(raw) ?? {};
+  const inputsRaw = Array.isArray(rec.inputs) ? rec.inputs : [];
+  const outputsRaw = Array.isArray(rec.outputs) ? rec.outputs : [];
+  const inputs: Dream["inputs"] = [];
+  for (const item of inputsRaw) {
+    const r = asRecord(item);
+    if (!r) continue;
+    if (r.type === "memory_store" && typeof r.memory_store_id === "string") {
+      inputs.push({ type: "memory_store", memory_store_id: r.memory_store_id });
+    } else if (r.type === "sessions" && Array.isArray(r.session_ids)) {
+      inputs.push({
+        type: "sessions",
+        session_ids: r.session_ids.filter((s): s is string => typeof s === "string"),
+      });
+    }
+  }
+  const outputs: Dream["outputs"] = [];
+  for (const item of outputsRaw) {
+    const r = asRecord(item);
+    if (r && r.type === "memory_store" && typeof r.memory_store_id === "string") {
+      outputs.push({ type: "memory_store", memory_store_id: r.memory_store_id });
+    }
+  }
+  return {
+    id: asString(rec.id),
+    status: (asString(rec.status, "pending") as DreamStatus) ?? "pending",
+    model: typeof rec.model === "string" ? rec.model : null,
+    inputs,
+    outputs,
+    sessionId: typeof rec.session_id === "string" ? rec.session_id : null,
+    createdAt: typeof rec.created_at === "string" ? rec.created_at : null,
+    updatedAt: typeof rec.updated_at === "string" ? rec.updated_at : null,
+    usage: asRecord(rec.usage),
+    raw,
+  };
+}
+
+export type CreateDreamInput = {
+  memoryStoreId: string;
+  sessionIds?: string[];
+  model?: string;
+  instructions?: string;
+};
+
+export async function createDream(input: CreateDreamInput): Promise<Dream> {
+  const inputs: Array<Record<string, unknown>> = [
+    { type: "memory_store", memory_store_id: input.memoryStoreId },
+  ];
+  if (input.sessionIds && input.sessionIds.length > 0) {
+    inputs.push({ type: "sessions", session_ids: input.sessionIds.slice(0, 100) });
+  }
+  const body: Record<string, unknown> = {
+    inputs,
+    model: input.model ?? "claude-sonnet-4-6",
+  };
+  if (input.instructions !== undefined) body.instructions = input.instructions;
+  const res = await withRetry(async () => {
+    const r = await fetch(`${ANTHROPIC_API_BASE}/v1/dreams`, {
+      method: "POST",
+      headers: dreamHeaders(),
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      const err = new Error(`dreams.create ${r.status}: ${text.slice(0, 400)}`);
+      (err as Error & { status?: number }).status = r.status;
+      throw err;
+    }
+    return r.json();
+  });
+  return toDream(res);
+}
+
+export async function getDream(dreamId: string): Promise<Dream> {
+  const res = await withRetry(async () => {
+    const r = await fetch(`${ANTHROPIC_API_BASE}/v1/dreams/${dreamId}`, {
+      headers: dreamHeaders(),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      const err = new Error(`dreams.retrieve ${r.status}: ${text.slice(0, 400)}`);
+      (err as Error & { status?: number }).status = r.status;
+      throw err;
+    }
+    return r.json();
+  });
+  return toDream(res);
+}
+
+export async function listDreams(): Promise<Dream[]> {
+  const res = await withRetry(async () => {
+    const r = await fetch(`${ANTHROPIC_API_BASE}/v1/dreams`, {
+      headers: dreamHeaders(),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      const err = new Error(`dreams.list ${r.status}: ${text.slice(0, 400)}`);
+      (err as Error & { status?: number }).status = r.status;
+      throw err;
+    }
+    return r.json();
+  });
+  const rec = asRecord(res);
+  const data = rec && Array.isArray(rec.data) ? rec.data : [];
+  return data.map(toDream);
+}
+
+export async function cancelDream(dreamId: string): Promise<Dream> {
+  const res = await withRetry(async () => {
+    const r = await fetch(`${ANTHROPIC_API_BASE}/v1/dreams/${dreamId}/cancel`, {
+      method: "POST",
+      headers: dreamHeaders(),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      const err = new Error(`dreams.cancel ${r.status}: ${text.slice(0, 400)}`);
+      (err as Error & { status?: number }).status = r.status;
+      throw err;
+    }
+    return r.json();
+  });
+  return toDream(res);
+}
+
+function streamSessionDefault(sessionId: SessionId): AsyncIterable<IncomingSessionEvent> {
   return {
     [Symbol.asyncIterator]() {
       let inner: AsyncIterator<unknown> | null = null;
@@ -587,4 +794,8 @@ export function streamSession(sessionId: SessionId): AsyncIterable<IncomingSessi
       };
     },
   };
+}
+
+export function streamSession(sessionId: SessionId): AsyncIterable<IncomingSessionEvent> {
+  return _managedAgentClient.streamSession(sessionId);
 }

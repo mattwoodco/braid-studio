@@ -14,6 +14,8 @@ export async function GET(
 ): Promise<Response> {
   const { sessionId } = await ctx.params;
   const encoder = new TextEncoder();
+  console.log("[studio/events] stream open", sessionId);
+  let eventCount = 0;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -41,9 +43,21 @@ export async function GET(
       try {
         for await (const event of streamSession(sessionId)) {
           if (closed) break;
+          eventCount++;
+          if (eventCount <= 5 || event.type !== "agent.thinking") {
+            console.log(
+              "[studio/events]",
+              sessionId.slice(0, 16),
+              "#",
+              eventCount,
+              event.type,
+              event.type === "session.status_idle" ? `stop=${event.stopReason}` : "",
+            );
+          }
           const payload = `data: ${JSON.stringify(event)}\n\n`;
           controller.enqueue(encoder.encode(payload));
           if (event.type === "session.status_idle" && event.stopReason === "end_turn") {
+            console.log("[studio/events] closing on end_turn", sessionId.slice(0, 16));
             safeClose();
             return;
           }

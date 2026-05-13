@@ -750,6 +750,303 @@ async function reportMode(): Promise<void> {
   }
 }
 
+// ----- Dry-run (Unit 7) — exercises the versioned-envelope routes against
+// injected fakes, calling route handlers as functions (no Next dev server). ---
+
+import type { DraftsStorage } from "@/lib/drafts";
+import { setDraftsStorage } from "@/lib/drafts";
+import type { GenerateInput, GenerateOutput, VideoBackend } from "@/lib/video-backend";
+import { setVideoBackend } from "@/lib/video-backend";
+import {
+  POST as draftPOST,
+  setShotPlanner,
+} from "../src/app/api/projects/[storeId]/draft/route";
+import { POST as headPOST } from "../src/app/api/projects/[storeId]/drafts/head/route";
+import {
+  GET as snapshotGET,
+  setSnapshotMemoryLister,
+} from "../src/app/api/memory/[storeId]/snapshot/route";
+
+type DryStoredEntry = {
+  id: string;
+  path: string;
+  content: string;
+  updatedAt: string;
+};
+
+function makeDryStorage(): {
+  storage: DraftsStorage;
+  entries: Map<string, DryStoredEntry>;
+} {
+  const entries = new Map<string, DryStoredEntry>();
+  let idCounter = 0;
+  const storage: DraftsStorage = {
+    async create(storeId, path, content) {
+      const key = `${storeId}::${path}`;
+      if (entries.has(key)) {
+        throw new Error(`already exists: ${path}`);
+      }
+      idCounter += 1;
+      const entry: DryStoredEntry = {
+        id: `mem_${idCounter}`,
+        path,
+        content,
+        updatedAt: new Date().toISOString(),
+      };
+      entries.set(key, entry);
+      return { id: entry.id, path: entry.path, content: entry.content };
+    },
+    async update(storeId, memoryId, content) {
+      for (const [key, entry] of entries) {
+        if (entry.id === memoryId && key.startsWith(`${storeId}::`)) {
+          entry.content = content;
+          entry.updatedAt = new Date().toISOString();
+          return { id: entry.id, path: entry.path, content: entry.content };
+        }
+      }
+      throw new Error(`not found: ${memoryId}`);
+    },
+    async list(storeId, prefix) {
+      const out: { id: string; path: string }[] = [];
+      for (const [key, entry] of entries) {
+        if (!key.startsWith(`${storeId}::`)) continue;
+        if (prefix && !entry.path.startsWith(prefix)) continue;
+        out.push({ id: entry.id, path: entry.path });
+      }
+      return out;
+    },
+    async read(storeId, memoryId) {
+      for (const [key, entry] of entries) {
+        if (entry.id === memoryId && key.startsWith(`${storeId}::`)) {
+          return { id: entry.id, path: entry.path, content: entry.content };
+        }
+      }
+      throw new Error(`not found: ${memoryId}`);
+    },
+  };
+  return { storage, entries };
+}
+
+function makeDryVideoBackend(): VideoBackend {
+  let callIdx = 0;
+  return {
+    async generateAndCompose(input: GenerateInput): Promise<GenerateOutput> {
+      const locked = input.lockedUrls ?? {};
+      const shotUrls: (string | null)[] = new Array(input.prompts.length).fill(
+        null,
+      );
+      for (let i = 0; i < input.prompts.length; i += 1) {
+        const lk = locked[i];
+        if (lk !== undefined) {
+          shotUrls[i] = lk;
+        } else {
+          callIdx += 1;
+          shotUrls[i] = `https://fake.example/shot-${callIdx}.mp4`;
+        }
+      }
+      return {
+        shotUrls,
+        mp4LocalPath: `/tmp/fake-${input.outputBasename}.mp4`,
+        durationSeconds: 15,
+        fileBytes: 123_456,
+        modelUsed: "fake-video-v1",
+      };
+    },
+  };
+}
+
+function dryAssert(cond: boolean, label: string, detail = ""): void {
+  if (cond) {
+    console.log(`[PASS] ${label}${detail ? ` — ${detail}` : ""}`);
+  } else {
+    console.error(`[FAIL] ${label}${detail ? ` — ${detail}` : ""}`);
+    process.exit(1);
+  }
+}
+
+async function readJson<T>(res: Response): Promise<T> {
+  return (await res.json()) as T;
+}
+
+interface DryDraftRes {
+  version: string;
+  mp4LocalPath: string;
+  head: { version: string; updated_at: string };
+  envelope: {
+    version: string;
+    parent: string | null;
+    reason: string;
+    shots: { n: number; prompt: string; video_url: string | null }[];
+    locked_shots: number[];
+  };
+}
+
+interface DrySweepRes {
+  sweep_run_id: string;
+  variants: {
+    version: string;
+    sweep_run_id?: string;
+    reason: string;
+  }[];
+}
+
+interface DryHeadRes {
+  head: { version: string; updated_at: string };
+}
+
+interface DrySnapshotRes {
+  drafts: { version: string }[];
+  head: { version: string; updated_at: string } | null;
+}
+
+async function runDryRun(): Promise<number> {
+  console.log("[acceptance] DRY-RUN mode (fake storage + fake video backend)");
+  const { storage } = makeDryStorage();
+  setDraftsStorage(storage);
+  setVideoBackend(makeDryVideoBackend());
+  setShotPlanner(async (_brief, n) => {
+    const out: string[] = [];
+    for (let i = 1; i <= n; i += 1) out.push(`prompt ${i}`);
+    return out;
+  });
+  // Snapshot's non-draft memory lister: route is empty for dry-run.
+  setSnapshotMemoryLister(async () => []);
+
+  const storeId = "store_dryrun";
+  let steps = 0;
+
+  // Step a) create
+  {
+    const req = new Request("http://local/draft", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "create", brief: "a dry-run brief" }),
+    });
+    const res = await draftPOST(req, { params: Promise.resolve({ storeId }) });
+    dryAssert(res.status === 200, "create: status 200", `got ${res.status}`);
+    const body = await readJson<DryDraftRes>(res);
+    dryAssert(body.head.version === "v1", "create: head.version === v1", body.head.version);
+    dryAssert(body.envelope.version === "v1", "create: envelope.version === v1");
+    dryAssert(body.envelope.reason === "create", "create: reason === create");
+    dryAssert(body.envelope.shots.length === 3, "create: 3 shots planned");
+    steps += 1;
+  }
+
+  // Step b) sweep
+  let sweepRunId = "";
+  let sweepVersions: string[] = [];
+  {
+    const req = new Request("http://local/draft", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        mode: "sweep",
+        brief: "sweep brief",
+        sweep: { axis: "model", values: ["a", "b"] },
+      }),
+    });
+    const res = await draftPOST(req, { params: Promise.resolve({ storeId }) });
+    dryAssert(res.status === 200, "sweep: status 200", `got ${res.status}`);
+    const body = await readJson<DrySweepRes>(res);
+    dryAssert(body.variants.length === 2, "sweep: 2 variants returned");
+    sweepRunId = body.sweep_run_id;
+    sweepVersions = body.variants.map((v) => v.version);
+    const sharedIds = new Set(body.variants.map((v) => v.sweep_run_id));
+    dryAssert(
+      sharedIds.size === 1 && sharedIds.has(sweepRunId),
+      "sweep: variants share one sweep_run_id",
+    );
+    // HEAD still v1
+    const headReq = new Request("http://local/head", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ version: "v1" }),
+    });
+    // Don't promote — just read snapshot to check head still v1
+    void headReq;
+    const snapReq = new Request("http://local/snapshot");
+    const snapRes = await snapshotGET(snapReq, {
+      params: Promise.resolve({ storeId }),
+    });
+    const snap = await readJson<DrySnapshotRes>(snapRes);
+    dryAssert(snap.head?.version === "v1", "sweep: HEAD still v1", String(snap.head?.version));
+    steps += 1;
+  }
+
+  // Step c) constrain
+  {
+    const req = new Request("http://local/draft", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        mode: "constrain",
+        parent: "v1",
+        locked_shots: [0],
+      }),
+    });
+    const res = await draftPOST(req, { params: Promise.resolve({ storeId }) });
+    dryAssert(res.status === 200, "constrain: status 200", `got ${res.status}`);
+    const body = await readJson<DryDraftRes>(res);
+    // After v1 (create) + v2,v3 (sweep), constrain should be v4.
+    dryAssert(
+      body.envelope.version === "v4",
+      "constrain: envelope.version === v4",
+      body.envelope.version,
+    );
+    dryAssert(body.envelope.parent === "v1", "constrain: parent === v1");
+    dryAssert(body.head.version === "v4", "constrain: HEAD advanced to v4");
+    dryAssert(
+      JSON.stringify(body.envelope.locked_shots) === "[0]",
+      "constrain: locked_shots === [0]",
+    );
+    steps += 1;
+  }
+
+  // Step d) promote HEAD to v3 (one of the sweep variants)
+  {
+    const promoteVersion = sweepVersions[1] ?? "v3";
+    const req = new Request("http://local/head", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ version: promoteVersion }),
+    });
+    const res = await headPOST(req, { params: Promise.resolve({ storeId }) });
+    dryAssert(res.status === 200, "promote: status 200", `got ${res.status}`);
+    const body = await readJson<DryHeadRes>(res);
+    dryAssert(
+      body.head.version === promoteVersion,
+      `promote: head.version === ${promoteVersion}`,
+      body.head.version,
+    );
+    steps += 1;
+  }
+
+  // Step e) snapshot
+  {
+    const req = new Request("http://local/snapshot");
+    const res = await snapshotGET(req, { params: Promise.resolve({ storeId }) });
+    dryAssert(res.status === 200, "snapshot: status 200", `got ${res.status}`);
+    const body = await readJson<DrySnapshotRes>(res);
+    dryAssert(
+      body.drafts.length === 4,
+      "snapshot: drafts.length === 4",
+      String(body.drafts.length),
+    );
+    dryAssert(
+      body.head?.version === "v3",
+      "snapshot: head.version === v3",
+      String(body.head?.version),
+    );
+    // Versions in ascending order
+    const vs = body.drafts.map((d) => d.version).join(",");
+    dryAssert(vs === "v1,v2,v3,v4", "snapshot: drafts ascending", vs);
+    steps += 1;
+  }
+
+  console.log(`\n[acceptance] DRY-RUN ${steps} steps PASSED`);
+  return steps;
+}
+
 // ----- Main -----
 
 async function main(): Promise<void> {
@@ -757,6 +1054,11 @@ async function main(): Promise<void> {
     await reportMode();
     return;
   }
+  if (process.env.LIVE !== "1") {
+    await runDryRun();
+    return;
+  }
+  console.log("[acceptance] LIVE mode (real fal + Anthropic)");
   console.log("[acceptance] waiting for server health...");
   await waitForHealth();
   console.log("[acceptance] creating project...");

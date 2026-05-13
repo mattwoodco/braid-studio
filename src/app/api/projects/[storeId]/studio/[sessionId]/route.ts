@@ -27,16 +27,17 @@ export async function POST(
   if (!parsed.success) {
     return NextResponse.json({ error: "invalid_body" }, { status: 400 });
   }
+  console.log(
+    "[studio/followup] POST",
+    { sessionId, contentLen: parsed.data.content.length },
+  );
   try {
     await sendEvent(sessionId, { type: "user.message", content: parsed.data.content });
+    console.log("[studio/followup] sendEvent ok", sessionId);
     return NextResponse.json({ ok: true });
   } catch (err) {
-    return NextResponse.json(
-      {
-        error: "send_failed",
-        message: err instanceof Error ? err.message : String(err),
-      },
-      { status: 500 },
-    );
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[studio/followup] sendEvent failed", { sessionId, message });
+    return NextResponse.json({ error: "send_failed", message }, { status: 500 });
   }
 }
